@@ -1,0 +1,248 @@
+package ru.arc.config
+
+import io.kotest.core.spec.style.FreeSpec
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.types.shouldBeInstanceOf
+import java.nio.file.Files
+
+class ConfigTest : FreeSpec({
+    "Config" - {
+        "should read int and string from yaml" {
+            val dir = Files.createTempDirectory("arc-core-config")
+            val yaml = dir.resolve("test.yml")
+            Files.writeString(
+                yaml,
+                """
+                server-name: proxy-test
+                nested:
+                  count: 42
+                """.trimIndent(),
+            )
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "test.yml")
+            config.load()
+
+            config.string("server-name", "default") shouldBe "proxy-test"
+            config.int("nested.count", 0) shouldBe 42
+        }
+
+        "should inject missing keys with defaults" {
+            val dir = Files.createTempDirectory("arc-core-config-defaults")
+            val yaml = dir.resolve("empty.yml")
+            Files.writeString(yaml, "{}\n")
+
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "empty.yml")
+
+            config.boolean("feature.enabled", true) shouldBe true
+            config.string("feature.name", "ProxyARC") shouldBe "ProxyARC"
+            config.exists("feature.enabled") shouldBe true
+            config.exists("feature.name") shouldBe true
+        }
+
+        "should preserve yaml comments after reload" {
+            val dir = Files.createTempDirectory("arc-core-config-comments")
+            val yaml = dir.resolve("comments.yml")
+            Files.writeString(
+                yaml,
+                """
+                # header comment
+                key: value
+                """.trimIndent(),
+            )
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "comments.yml")
+            config.load()
+            config.string("key", "") shouldBe "value"
+            config.save()
+            config.load()
+
+            Files.readString(yaml) shouldContain "header comment"
+        }
+
+        "should load synthetic emoji yaml fixture" {
+            val dir = Files.createTempDirectory("arc-core-config-emoji")
+            val resource =
+                java.util.Objects.requireNonNull(
+                    javaClass.classLoader.getResourceAsStream("config/config-emoji.yml"),
+                ) { "config/config-emoji.yml fixture missing" }
+            resource.use { Files.copy(it, dir.resolve("config.yml")) }
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "config.yml")
+            config.load()
+            config.string("message") shouldBe "Готово 💰"
+        }
+
+        "should load emoji when its high surrogate lands on the SnakeYAML buffer edge" {
+            val dir = Files.createTempDirectory("arc-core-config-surrogate-boundary")
+            val yaml = dir.resolve("boundary.yml")
+            val prefix = "main-server: true\nvalue: '"
+            val emoji = "\uD83D\uDCB2"
+            val filler = "a".repeat(1024 - prefix.length)
+            val content = "$prefix$filler$emoji'\n"
+            content.indexOf(emoji.first()) shouldBe 1024
+            Files.writeString(yaml, content)
+            ConfigManager.clear()
+
+            val config = ConfigManager.of(dir, "boundary.yml")
+
+            config.bool("main-server", false) shouldBe true
+            config.string("value") shouldBe filler + emoji
+        }
+
+        "should atomically persist a validated structured subtree" {
+            val dir = Files.createTempDirectory("arc-core-config-structured")
+            val yaml = dir.resolve("structured.yml")
+            Files.writeString(yaml, "content: {}\n")
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "structured.yml")
+
+            config.setStructured(
+                "content.reward",
+                mapOf(
+                    "material" to "DIAMOND",
+                    "amount" to 3,
+                    "lore" to listOf("<gray>One", "<gold>Two"),
+                    "customData" to mapOf("arc:key" to "reward"),
+                ),
+            )
+            config.saveStrict()
+            config.reload()
+
+            config.string("content.reward.material") shouldBe "DIAMOND"
+            config.int("content.reward.amount") shouldBe 3
+            config.stringList("content.reward.lore") shouldBe listOf("<gray>One", "<gold>Two")
+            config.string("content.reward.customData.arc:key") shouldBe "reward"
+            Files
+                .list(dir)
+                .use { stream -> stream.noneMatch { it.fileName.toString().endsWith(".tmp") } } shouldBe true
+        }
+
+        "should reject unsupported structured values" {
+            val dir = Files.createTempDirectory("arc-core-config-unsupported")
+            Files.writeString(dir.resolve("test.yml"), "{}\n")
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "test.yml")
+
+            runCatching {
+                config.setStructured("bad", java.math.BigDecimal.ONE)
+            }.exceptionOrNull().shouldBeInstanceOf<IllegalArgumentException>()
+        }
+
+        "should merge new bundled keys without replacing operator values" {
+            val dir = Files.createTempDirectory("arc-core-config-merge")
+            val yaml = dir.resolve("module.yml")
+            Files.writeString(
+                yaml,
+                """
+                feature:
+                  enabled: false
+                  operator-note: keep-me
+                list:
+                  - operator-value
+                unknown:
+                  nested: 42
+                """.trimIndent() + "\n",
+            )
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "module.yml")
+
+            config.mergeMissingFromBundled("config/merge-defaults.yml") shouldBe true
+            config.boolean("feature.enabled", true) shouldBe false
+            config.string("feature.operator-note") shouldBe "keep-me"
+            config.string("feature.title") shouldBe "Bundled title"
+            config.stringList("list") shouldBe listOf("operator-value")
+            config.int("unknown.nested") shouldBe 42
+            config.string("new-section.message") shouldBe "Added safely"
+
+            val afterFirstMerge = Files.readString(yaml)
+            config.mergeMissingFromBundled("config/merge-defaults.yml") shouldBe false
+            Files.readString(yaml) shouldBe afterFirstMerge
+
+            ConfigManager.clear()
+            val reloaded = ConfigManager.of(dir, "module.yml")
+            reloaded.boolean("feature.enabled", true) shouldBe false
+            reloaded.string("feature.title") shouldBe "Bundled title"
+            reloaded.string("new-section.message") shouldBe "Added safely"
+        }
+
+        "should preserve paired MiniMessage hex tags while merging bundled defaults" {
+            val dir = Files.createTempDirectory("arc-core-config-merge-minimessage")
+            val yaml = dir.resolve("module.yml")
+            val title = "<#92bed8>Пользовательский вызов</#92bed8>"
+            Files.writeString(
+                yaml,
+                """
+                feature:
+                  enabled: false
+                  title: '$title'
+                """.trimIndent() + "\n",
+            )
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "module.yml")
+
+            config.mergeMissingFromBundled("config/merge-defaults.yml") shouldBe true
+            config.string("feature.title") shouldBe "<color:#92bed8>Пользовательский вызов</color>"
+
+            ConfigManager.clear()
+            ConfigManager.of(dir, "module.yml").string("feature.title") shouldBe
+                "<color:#92bed8>Пользовательский вызов</color>"
+        }
+
+        "should preserve an explicit type conflict for feature validation" {
+            val dir = Files.createTempDirectory("arc-core-config-merge-conflict")
+            val yaml = dir.resolve("module.yml")
+            Files.writeString(yaml, "feature: operator-scalar\n")
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "module.yml")
+
+            config.mergeMissingFromBundled("config/merge-defaults.yml") shouldBe true
+            config.string("feature") shouldBe "operator-scalar"
+            config.stringOrNull("feature.title") shouldBe null
+            config.string("new-section.message") shouldBe "Added safely"
+        }
+
+        "should exclude operator-owned root sections from an additive merge" {
+            val dir = Files.createTempDirectory("arc-core-config-merge-excluded")
+            val yaml = dir.resolve("module.yml")
+            Files.writeString(
+                yaml,
+                """
+                feature:
+                  enabled: false
+                """.trimIndent() + "\n",
+            )
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "module.yml")
+
+            config.mergeMissingFromBundled(
+                "config/merge-defaults.yml",
+                excludedRootKeys = setOf("feature", "excluded-section"),
+            ) shouldBe true
+            config.boolean("feature.enabled", true) shouldBe false
+            config.stringOrNull("feature.title") shouldBe null
+            config.exists("excluded-section") shouldBe false
+            config.string("new-section.message") shouldBe "Added safely"
+            val afterFirstMerge = Files.readString(yaml)
+            config.mergeMissingFromBundled(
+                "config/merge-defaults.yml",
+                excludedRootKeys = setOf("feature", "excluded-section"),
+            ) shouldBe false
+            Files.readString(yaml) shouldBe afterFirstMerge
+        }
+
+        "should fail without mutating the file when bundled defaults are missing" {
+            val dir = Files.createTempDirectory("arc-core-config-merge-missing")
+            val yaml = dir.resolve("module.yml")
+            Files.writeString(yaml, "feature: true\n")
+            ConfigManager.clear()
+            val config = ConfigManager.of(dir, "module.yml")
+
+            runCatching {
+                config.mergeMissingFromBundled("config/not-packaged.yml")
+            }.exceptionOrNull().shouldBeInstanceOf<IllegalArgumentException>()
+            Files.readString(yaml) shouldBe "feature: true\n"
+        }
+    }
+})
