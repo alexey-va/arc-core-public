@@ -47,7 +47,6 @@ jobs:
       - run: ./gradlew --build-cache testAll
 
   integration:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.heavy_tests }}
     name: Redis and MySQL integration tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
